@@ -9,6 +9,8 @@ const chalk               = require('chalk'),
       fs                  = require('fs'),
       http                = require('http'),
       https               = require('https'),
+      axios               = require('axios'),
+      basicAuth           = require('basic-auth-token'),
       path                = require('path'),
       extend              = require('extend'),
       hbs                 = require('hbs'),
@@ -25,8 +27,11 @@ const chalk               = require('chalk'),
 /**
  * Globals
  */
+ require('dotenv').config()
 
 const IDP_PATHS = {
+  AUTHN: '/authn',
+  SEND_JWT: '/saml/assertion',
   SSO: '/saml/sso',
   SLO: '/saml/slo',
   METADATA: '/metadata',
@@ -190,13 +195,13 @@ function processArgs(args, options) {
       cert: {
         description: 'IdP Signature PublicKey Certificate',
         required: true,
-        default: './idp-public-cert.pem',
+        default: '~/.ssh/idp-public-cert.pem',
         coerce: makeCertFileCoercer('certificate', 'IdP Signature PublicKey Certificate', KEY_CERT_HELP_TEXT)
       },
       key: {
         description: 'IdP Signature PrivateKey Certificate',
         required: true,
-        default: './idp-private-key.pem',
+        default: '~/.ssh/idp-private-key.pem',
         coerce: makeCertFileCoercer('RSA private key', 'IdP Signature PrivateKey Certificate', KEY_CERT_HELP_TEXT)
       },
       issuer: {
@@ -427,11 +432,11 @@ function _runServer(argv) {
                               redirect: IDP_PATHS.SLO,
                               post: IDP_PATHS.SLO
                             } : {},
-    getUserFromRequest:     function(req) { return req.user; },
+    getUserFromRequest:     function(req) { return req.session.user; },
     getPostURL:             function (audience, authnRequestDom, req, callback) {
                               return callback(null, (req.authnRequest && req.authnRequest.acsUrl) ?
                                 req.authnRequest.acsUrl :
-                                req.idp.options.acsUrl);
+                                req.session.idp.options.acsUrl);
                             },
     transformAssertion:     function(assertionDom) {
                               if (argv.authnContextDecl) {
@@ -449,7 +454,7 @@ function _runServer(argv) {
                                 }
                               }
                             },
-    responseHandler:        function(response, opts, req, res, next) {
+    responseHandler:        async function(response, opts, req, res, next) {
                               console.log(dedent(chalk`
                                 Sending SAML Response to {cyan ${opts.postUrl}} =>
                                   {bold RelayState} =>
@@ -457,13 +462,46 @@ function _runServer(argv) {
                                   {bold SAMLResponse} =>`
                               ));
 
-                              console.log(prettyPrintXml(response.toString(), 4));
+                              const raw = response.toString();
+                              console.log(prettyPrintXml(raw, 4));
 
-                              res.render('samlresponse', {
-                                AcsUrl: opts.postUrl,
-                                SAMLResponse: response.toString('base64'),
-                                RelayState: opts.RelayState
-                              });
+                              if (req.session.sendJwt) {
+                                console.log('Decode This for Saml Bearer - ' + response.toString('base64'));
+                                const startIndex = raw.indexOf('<saml:Assertion');
+                                let endIndex = raw.indexOf('</saml:Assertion');
+                                endIndex = raw.indexOf('>', endIndex);
+                                const assertion = raw.substring(startIndex, endIndex+1);
+                                const assertionB64 = Buffer.from(assertion).toString('base64');
+                                console.log('SAML Bearer - ', assertionB64);
+  
+                                const params = new URLSearchParams();
+                                params.append('grant_type', 'urn:ietf:params:oauth:grant-type:saml2-bearer');
+                                params.append('scope', process.env.SCOPES);
+                                params.append('assertion', assertionB64);
+                                const thisRes = res;
+                                axios.post(
+                                  process.env.ISSUER + '/v1/token',
+                                  params, {
+                                    headers: {
+                                      'Content-Type': 'application/x-www-form-urlencoded',
+                                      Authorization: 'Basic ' + basicAuth(process.env.CLIENT_ID, process.env.CLIENT_SECRET)
+                                    }
+                                  })
+                                  .then(res=>{
+                                    console.log(res.data);
+                                    thisRes.render('samlbearer', {
+                                      callbackUrl: process.env.SSO_ASSERTION_ENDPOINT,
+                                      idToken: res.data.id_token,
+                                      accessToken: res.data.access_token
+                                    });    
+                                  })
+                              } else {
+                                res.render('samlresponse', {
+                                  AcsUrl: opts.postUrl,
+                                  SAMLResponse: response.toString('base64'),
+                                  RelayState: opts.RelayState
+                                });
+                              }
                             }
   }
 
@@ -540,12 +578,21 @@ function _runServer(argv) {
 
   const showUser = function (req, res, next) {
     res.render('user', {
-      user: req.user,
+      user: req.session.user,
       participant: req.participant,
       metadata: req.metadata,
       authnRequest: req.authnRequest,
-      idp: req.idp.options,
+      idp: req.session.idp.options,
       paths: IDP_PATHS
+    });
+  }
+
+  const loginPage = function (req, res, next) {
+    res.render('authn', {
+      metadata: req.metadata,
+      idp: req.session.idp.options,
+      paths: IDP_PATHS,
+      messages: []
     });
   }
 
@@ -553,7 +600,124 @@ function _runServer(argv) {
    * Shared Handlers
    */
 
-  const parseSamlRequest = function(req, res, next) {
+  const showLoginPage = function(req, res, next) {
+    return loginPage(req, res, next);
+  };
+
+  const callAuthn = async function(req, res, next) {
+    const params = new URLSearchParams();
+    params.append('grant_type', 'password');
+    params.append('scope', 'openid profile email phone');
+    params.append('username', req.body.authnUsername);
+    params.append('password', req.body.authnPassword);
+
+    axios.post(
+      process.env.FAKE_IDP_RO_ISSUER + '/v1/token', 
+      params, {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: 'Basic ' + basicAuth(process.env.FAKE_IDP_RO_CLIENT_ID, process.env.FAKE_IDP_RO_CLIENT_SECRET)
+        }
+      }
+    )    
+    .then(authnRes => {
+      axios.get(
+        process.env.FAKE_IDP_RO_ISSUER + '/v1/userinfo', {
+          headers: {
+            Authorization: 'Bearer ' + authnRes.data.access_token
+          }
+        }
+      )
+      .then(userinfoRes => {
+        const authnUser = {
+          userName: userinfoRes.data.preferred_username,
+          nameIdFormat: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+          firstName: userinfoRes.data.given_name,
+          lastName: userinfoRes.data.family_name,
+          displayName: userinfoRes.data.name,
+          email: userinfoRes.data.email,
+          mobilePhone: userinfoRes.data.phone_number,
+          groups: userinfoRes.data.groups ? userinfoRes.data.groups.join() : ''
+        };
+        Object.keys(authnUser).forEach(key=>{
+          req.session.user[key] = authnUser[key];
+        });
+        res.redirect('/');
+      })
+      .catch(uErr => {
+        console.log(uErr.response.data);
+      })
+    })
+    .catch(err => {
+      console.log(err.response.data);
+      // return res.render('error', {
+      //   message: err.response.data.error_description
+      // });
+      return loginPage(req, res, next); 
+    })
+  };
+
+  const signin = function(req, res) {
+    let authOptions = {};
+    let defaults = extend({}, req.idp.options);
+    Object.keys(defaults).forEach(key=>{
+      authOptions[key] = defaults[key];
+
+      const value = req.session.idp.options[key];
+      if (value && (typeof value == "string" || typeof value == "boolean")) {
+        console.log('GET from', key);
+        authOptions[key] = value;
+      }
+    });
+    console.log('authOptions:', authOptions);
+
+    Object.keys(req.body).forEach(function(key) {
+      var buffer;
+      if (key === '_authnRequest') {
+        buffer = new Buffer(req.body[key], 'base64');
+        req.authnRequest = JSON.parse(buffer.toString('utf8'));
+
+        // Apply AuthnRequest Params
+        authOptions.inResponseTo = req.authnRequest.id;
+        if (req.session.idp.options.allowRequestAcsUrl && req.authnRequest.acsUrl) {
+          authOptions.acsUrl = req.authnRequest.acsUrl;
+          authOptions.recipient = req.authnRequest.acsUrl;
+          authOptions.destination = req.authnRequest.acsUrl;
+          authOptions.forceAuthn = req.authnRequest.forceAuthn;
+        }
+        if (req.authnRequest.relayState) {
+          authOptions.RelayState = req.authnRequest.relayState;
+        }
+      } else {
+        req.session.user[key] = req.body[key];
+      }
+    });
+
+    if (!authOptions.encryptAssertion) {
+      delete authOptions.encryptionCert;
+      delete authOptions.encryptionPublicKey;
+    }
+
+    // Set Session Index
+    authOptions.sessionIndex = getSessionIndex(req);
+
+    // Keep calm and Single Sign On
+    console.log(dedent(chalk`
+      Generating SAML Response using =>
+        {bold User} => ${Object.entries(req.session.user).map(([key, value]) => chalk`
+          ${key}: {cyan ${value}}`
+        ).join('')}
+        {bold SAMLP Options} => ${Object.entries(authOptions).map(([key, value]) => chalk`
+          ${key}: {cyan ${formatOptionValue(key, value)}}`
+        ).join('')}
+    `));
+    samlp.auth(authOptions)(req, res);
+  }
+
+  const parseSamlRequest = function(req, res, next) {   
+    if (!req.session.user || Object.keys(req.session.user).length == 0) {
+      res.redirect(IDP_PATHS.AUTHN);
+    }
     samlp.parseRequest(req, function(err, data) {
       if (err) {
         return res.render('error', {
@@ -584,16 +748,16 @@ function _runServer(argv) {
 
   const getParticipant = function(req) {
     return {
-      serviceProviderId: req.idp.options.serviceProviderId,
+      serviceProviderId: req.session.idp.options.serviceProviderId,
       sessionIndex: getSessionIndex(req),
-      nameId: req.user.userName,
-      nameIdFormat: req.user.nameIdFormat,
-      serviceProviderLogoutURL: req.idp.options.sloUrl
+      nameId: req.session.user.userName,
+      nameIdFormat: req.session.user.nameIdFormat,
+      serviceProviderLogoutURL: req.session.idp.options.sloUrl
     }
   }
 
   const parseLogoutRequest = function(req, res, next) {
-    if (!req.idp.options.sloUrl) {
+    if (!req.session.idp.options.sloUrl) {
       return res.render('error', {
         message: 'SAML Single Logout Service URL not defined for Service Provider'
       });
@@ -602,11 +766,11 @@ function _runServer(argv) {
     console.log('Processing SAML SLO request for participant => \n', req.participant);
 
     return samlp.logout({
-      issuer:                 req.idp.options.issuer,
-      cert:                   req.idp.options.cert,
-      key:                    req.idp.options.key,
-      digestAlgorithm:        req.idp.options.digestAlgorithm,
-      signatureAlgorithm:     req.idp.options.signatureAlgorithm,
+      issuer:                 req.session.idp.options.issuer,
+      cert:                   req.session.idp.options.cert,
+      key:                    req.session.idp.options.key,
+      digestAlgorithm:        req.session.idp.options.digestAlgorithm,
+      signatureAlgorithm:     req.session.idp.options.signatureAlgorithm,
       sessionParticipants:    new SessionParticipants(
       [
         req.participant
@@ -625,6 +789,7 @@ function _runServer(argv) {
 
   app.use(function(req, res, next){
     if (argv.rollSession) {
+      console.log('ROLL SESSION')
       req.session.regenerate(function(err) {
         return next();
       });
@@ -634,12 +799,19 @@ function _runServer(argv) {
   });
 
   app.use(function(req, res, next){
-    req.user = argv.config.user;
     req.metadata = argv.config.metadata;
     req.idp = { options: idpOptions };
-    req.participant = getParticipant(req);
+    if (req.session.user) {
+      req.participant = getParticipant(req);
+    } else {
+      req.session.user = {};
+      req.session.idp = { options: idpOptions };
+    }
     next();
   });
+
+  app.get(IDP_PATHS.AUTHN, showLoginPage);
+  app.post(IDP_PATHS.AUTHN, callAuthn);
 
   app.get(['/', '/idp', IDP_PATHS.SSO], parseSamlRequest);
   app.post(['/', '/idp', IDP_PATHS.SSO], parseSamlRequest);
@@ -648,52 +820,16 @@ function _runServer(argv) {
   app.post(IDP_PATHS.SLO, parseLogoutRequest);
 
   app.post(IDP_PATHS.SIGN_IN, function(req, res) {
-    const authOptions = extend({}, req.idp.options);
-    Object.keys(req.body).forEach(function(key) {
-      var buffer;
-      if (key === '_authnRequest') {
-        buffer = new Buffer(req.body[key], 'base64');
-        req.authnRequest = JSON.parse(buffer.toString('utf8'));
-
-        // Apply AuthnRequest Params
-        authOptions.inResponseTo = req.authnRequest.id;
-        if (req.idp.options.allowRequestAcsUrl && req.authnRequest.acsUrl) {
-          authOptions.acsUrl = req.authnRequest.acsUrl;
-          authOptions.recipient = req.authnRequest.acsUrl;
-          authOptions.destination = req.authnRequest.acsUrl;
-          authOptions.forceAuthn = req.authnRequest.forceAuthn;
-        }
-        if (req.authnRequest.relayState) {
-          authOptions.RelayState = req.authnRequest.relayState;
-        }
-      } else {
-        req.user[key] = req.body[key];
-      }
-    });
-
-    if (!authOptions.encryptAssertion) {
-      delete authOptions.encryptionCert;
-      delete authOptions.encryptionPublicKey;
-    }
-
-    // Set Session Index
-    authOptions.sessionIndex = getSessionIndex(req);
-
-    // Keep calm and Single Sign On
-    console.log(dedent(chalk`
-      Generating SAML Response using =>
-        {bold User} => ${Object.entries(req.user).map(([key, value]) => chalk`
-          ${key}: {cyan ${value}}`
-        ).join('')}
-        {bold SAMLP Options} => ${Object.entries(authOptions).map(([key, value]) => chalk`
-          ${key}: {cyan ${formatOptionValue(key, value)}}`
-        ).join('')}
-    `));
-    samlp.auth(authOptions)(req, res);
-  })
+    req.session.sendJwt = false;
+    signin(req, res);
+  });
+  app.get(IDP_PATHS.SEND_JWT, function(req, res) {
+    req.session.sendJwt = true;
+    signin(req, res);
+  });
 
   app.get(IDP_PATHS.METADATA, function(req, res, next) {
-    samlp.metadata(req.idp.options)(req, res);
+    samlp.metadata(req.session.idp.options)(req, res);
   });
 
   app.post(IDP_PATHS.METADATA, function(req, res, next) {
@@ -723,8 +859,8 @@ function _runServer(argv) {
   });
 
   app.get(IDP_PATHS.SIGN_OUT, function(req, res, next) {
-    if (req.idp.options.sloUrl) {
-      console.log('Initiating SAML SLO request for user: ' + req.user.userName +
+    if (req.session.idp.options.sloUrl) {
+      console.log('Initiating SAML SLO request for user: ' + req.session.user.userName +
       ' with sessionIndex: ' + getSessionIndex(req));
       res.redirect(IDP_PATHS.SLO);
     } else {
@@ -733,14 +869,14 @@ function _runServer(argv) {
         if (err) {
           throw err;
         }
-        res.redirect('back');
+        res.redirect(IDP_PATHS.AUTHN);
       })
     }
   });
 
   app.get([IDP_PATHS.SETTINGS], function(req, res, next) {
     res.render('settings', {
-      idp: req.idp.options
+      idp: req.session.idp.options
     });
   });
 
@@ -748,22 +884,22 @@ function _runServer(argv) {
     Object.keys(req.body).forEach(function(key) {
       switch(req.body[key].toLowerCase()){
         case "true": case "yes": case "1":
-          req.idp.options[key] = true;
+          req.session.idp.options[key] = true;
           break;
         case "false": case "no": case "0":
-          req.idp.options[key] = false;
+          req.session.idp.options[key] = false;
           break;
         default:
-          req.idp.options[key] = req.body[key];
+          req.session.idp.options[key] = req.body[key];
           break;
       }
 
       if (req.body[key].match(/^\d+$/)) {
-        req.idp.options[key] = parseInt(req.body[key], '10');
+        req.session.idp.options[key] = parseInt(req.body[key], '10');
       }
     });
 
-    console.log('Updated IdP Configuration => \n', req.idp.options);
+    console.log('Updated IdP Configuration => \n', req.session.idp.options);
     res.redirect('/');
   });
 
