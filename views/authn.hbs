@@ -1,0 +1,37 @@
+<div class="col-md-8 col-md-offset-2">
+  <div class="panel panel-primary">
+    {{!-- <div class="panel-heading">
+      <h3 class="panel-title"><i class="fa fa-code"><span>Login</span></i></h3>
+    </div> --}}
+    <div class="panel-body">
+      <form action="{{paths.AUTHN}}" class="form-horizontal form-authn" method="post" role="form">
+        <div>
+          <div class="panel panel-default">
+            <div class="panel-heading">
+              <h3 class="panel-title"><i class="fa fa-user-o"><span>Sign In</span></i></h3>
+            </div>
+            <div class="panel-body">
+              <div class="form-group">
+                <label class="col-sm-3 control-label" for="authnUsername">Username</label>
+                <div class="col-sm-9">
+                  <input class="form-control" id="authnUsername" name="authnUsername" placeholder="user@example.com" required="">
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="col-sm-3 control-label" for="authnPassword">Password</label>
+                <div class="col-sm-9">
+                  <input type="password" class="form-control" id="authnPassword" name="authnPassword" placeholder="xxxxxxxxxxxxx" required="">
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="col-md-12 text-right">
+              <button id="btn-authn" class="btn btn-primary input-xlarge" type="submit"><i class="fa fa-sign-in"><span>Sign in</span></i></button>
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>

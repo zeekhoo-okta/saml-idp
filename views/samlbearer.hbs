@@ -1,0 +1,22 @@
+<html>
+<head>
+    <title>SAML Bearer Demo</title>
+</head>
+<body>
+    <form method="POST" name="hiddenform" action="{{callbackUrl}}">
+        <input type="hidden"
+               name='access_token'
+               value='{{accessToken}}'>
+        <input type="hidden"
+               name='id_token'
+               value='{{idToken}}'>
+        <noscript>
+            <p>JavaScript is disabled. Click Submit to continue.</p>
+            <input type="submit" value="Submit">
+        </noscript>
+    </form>
+    <script language="javascript" type="text/javascript">
+        window.setTimeout(function(){document.forms[0].submit();}, 0);
+    </script>
+</body>
+</html>

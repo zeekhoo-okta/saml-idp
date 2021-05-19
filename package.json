@@ -26,9 +26,12 @@
     "node": ">=6.0.0"
   },
   "dependencies": {
+    "axios": "^0.21.1",
+    "basic-auth-token": "^0.4.2",
     "body-parser": "~1.19.0",
     "chalk": "^4.0.0",
     "debug": "~4.1.1",
+    "dotenv": "^9.0.2",
     "express": "^4.17.1",
     "express-session": "^1.17.1",
     "extend": "^3.0.2",
